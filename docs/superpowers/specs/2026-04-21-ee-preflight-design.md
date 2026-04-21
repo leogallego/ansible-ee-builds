@@ -16,6 +16,7 @@ A Python CLI tool that validates an `execution-environment.yml` definition befor
 ee-preflight <path/to/execution-environment.yml> [options]
 
 Options:
+  --fix                Automatically add discovered missing deps to the EE definition files
   --venv PATH          Use this venv path (kept after run for inspection)
   --keep-venv          Keep the default temp venv after run
   --container-test     Enable layer 3: test wheel builds inside the base image
@@ -31,13 +32,54 @@ lib/ee_preflight/
     __init__.py
     cli.py                        # arg parsing, output formatting
     runner.py                     # orchestrates layers, manages venv lifecycle
-    models.py                     # Finding, LayerResult, Severity
+    models.py                     # Finding, LayerResult, Severity, EEDefinition
+    ee_parser.py                  # parse execution-environment.yml (both formats)
+    fixer.py                      # --fix: write missing deps back to EE files
+    container.py                  # ContainerRuntime abstraction (podman, future docker)
     layers/
         __init__.py
         galaxy.py                 # Layer 1: collection resolution
         python_deps.py            # Layer 2: Python dep discovery + validation
         system_deps.py            # Layer 3: system dep + wheel build test
 ```
+
+### EE Definition Parsing
+
+`ansible-builder` v3 supports two ways to declare dependencies:
+
+**Separate files** (common in this repo):
+```yaml
+dependencies:
+  galaxy: requirements.yml
+  python: requirements.txt
+  system: bindep.txt
+```
+
+**Inline** (what `ansible-creator init execution_env` generates):
+```yaml
+dependencies:
+  galaxy:
+    collections:
+      - name: ansible.posix
+  python:
+    - boto3
+    - requests
+  system:
+    - openssh-clients
+```
+
+The parser must detect which format is used for each dependency type (they can be mixed — e.g., galaxy in a file, python inline). This affects both reading (for validation) and writing (for `--fix`). The parser normalizes both formats into the same internal representation.
+
+### --fix Mode
+
+When `--fix` is passed, the tool writes discovered missing dependencies back to the EE definition instead of just reporting them. It respects whichever format the EE uses:
+
+- **Separate files:** appends missing entries to `bindep.txt`, `requirements.txt`, etc.
+- **Inline:** adds entries to the appropriate section in `execution-environment.yml`.
+
+`--fix` only adds missing deps. It does not resolve version conflicts (those require user judgment — e.g., downgrade one collection or remove another). Conflicts are still reported as errors with suggested fixes.
+
+After writing changes, `--fix` prints a summary of what was added and to which file.
 
 Each layer is a function with the signature:
 
@@ -232,6 +274,7 @@ Result: FAIL (1 error, 2 warnings)
 | Tool | Minimum version | Purpose |
 |---|---|---|
 | `podman` | 4.0+ | Layer 3: container wheel build tests |
+| `ansible-creator` | 25.0.0+ | EE scaffolding (future `--init` mode) |
 
 The script checks tool availability and versions at startup. If a required tool is missing or too old, it exits with a clear message listing what to install. If `podman` is missing and `--container-test` is requested, it exits with an error specific to that flag.
 
@@ -244,6 +287,6 @@ Layer 3 interacts with the container runtime through a thin abstraction (`Contai
 - **Auto-populated dependency cache:** After layer 3 discovers a mapping (e.g., `gssapi` → `krb5-devel`), write it to a local `.ee-preflight-cache.json`. Subsequent runs check the cache first for instant answers, falling back to `dnf provides` for unknowns. Cache entries include the base image and timestamp so they can be invalidated.
 - **Docker support:** Add `docker` as an alternative container runtime for layer 3 via the `ContainerRuntime` interface. Auto-detect which is available, or allow `--runtime docker|podman`.
 - **Devcontainer support:** Run inside Ansible devcontainers where podman/docker may be accessed via docker-in-docker or a mounted socket. Detect the devcontainer environment and adjust runtime paths accordingly.
-- **`--fix` mode:** Automatically add discovered missing deps to `bindep.txt` and `requirements.txt` instead of just reporting them.
 - **CI integration:** GitHub Action that runs `ee-preflight` on PRs before `ansible-builder`, failing fast with actionable output.
 - **Base image collection diffing:** For `ee-supported` base images, inspect what's already installed and warn about collections/deps in the requirements that duplicate what's in the base image (the delta-only strategy).
+- **`--init` mode:** Scaffold a new EE project using `ansible-creator init execution_env`, then run preflight validation on it. Combines scaffolding with validation in a single workflow.
