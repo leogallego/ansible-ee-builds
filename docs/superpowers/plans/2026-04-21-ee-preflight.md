@@ -6,7 +6,9 @@
 
 **Architecture:** Python CLI with 4 validation layers (prechecks → galaxy → python/system deps → container wheel test), an EE parser supporting both file-ref and inline dep formats, a fixer for `--fix`, and a runner that orchestrates everything. Each layer returns findings; the runner decides whether to proceed.
 
-**Tech Stack:** Python 3.10+, ade, ansible-builder introspect, podman, ansible-lint (optional), PyYAML
+**Tech Stack:** Python 3.10+, ade, podman, ansible-lint (optional), PyYAML
+
+**Status (2026-04-21):** Tasks 1-8 implemented. Layer 1 uses `ade install` (not `ansible-galaxy`). Layer 2 uses ade's discovered deps (not `ansible-builder introspect`). 4/7 netbox failures caught. Next: auto-trigger Layer 3 when Layer 2 finds Python build failures (catches remaining 3/7).
 
 ---
 
