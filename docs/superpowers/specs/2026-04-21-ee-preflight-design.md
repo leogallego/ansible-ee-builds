@@ -38,6 +38,7 @@ lib/ee_preflight/
     container.py                  # ContainerRuntime abstraction (podman, future docker)
     layers/
         __init__.py
+        prechecks.py              # Layer 0: YAML lint, file refs, ARG/env checks
         galaxy.py                 # Layer 1: collection resolution
         python_deps.py            # Layer 2: Python dep discovery + validation
         system_deps.py            # Layer 3: system dep + wheel build test
@@ -110,6 +111,25 @@ class LayerResult:
     status: str               # "pass", "fail", "skipped"
     findings: list[Finding]
 ```
+
+## Layer 0: Pre-checks
+
+**Purpose:** Catch basic structural problems before attempting any installs. Fast, no network, no venv needed.
+
+**Implementation:**
+
+1. **YAML lint** (optional): If `ansible-lint` is available, run it against `execution-environment.yml`. Report formatting issues. If `ansible-lint` is not installed, skip with an info message — it's not a hard requirement.
+2. **File reference validation**: For each dependency declared as a file path (`galaxy: requirements.yml`, `python: requirements.txt`, `system: bindep.txt`), check the file exists relative to the EE directory.
+3. **Build arg / env var check**: Parse `additional_build_steps` for `ARG` declarations. For each `ARG`, check whether the corresponding env var is set in the current shell. Warn if not — this catches the "missing `--build-arg AH_TOKEN`" class of failures.
+4. **Base image format**: Validate the base image string looks like a valid registry path. Warn if it uses a SHA digest pin (not wrong, but unusual).
+
+**Findings reported:**
+- YAML formatting issues (from `ansible-lint`)
+- Missing dependency files referenced by `execution-environment.yml`
+- `ARG` declarations without matching env vars (e.g., `ARG AH_TOKEN` but `$AH_TOKEN` is not set)
+- Malformed base image references
+
+**Gate:** If dependency files are missing, layers 1-3 are skipped (nothing to validate). YAML formatting issues and missing env vars are reported as warnings — they don't block subsequent layers.
 
 ## Layer 1: Galaxy Resolution
 
@@ -274,6 +294,7 @@ Result: FAIL (1 error, 2 warnings)
 | Tool | Minimum version | Purpose |
 |---|---|---|
 | `podman` | 4.0+ | Layer 3: container wheel build tests |
+| `ansible-lint` | 24.0.0+ | Layer 0: YAML formatting validation |
 | `ansible-creator` | 25.0.0+ | EE scaffolding (future `--init` mode) |
 
 The script checks tool availability and versions at startup. If a required tool is missing or too old, it exits with a clear message listing what to install. If `podman` is missing and `--container-test` is requested, it exits with an error specific to that flag.
