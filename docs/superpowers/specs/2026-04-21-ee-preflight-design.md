@@ -17,12 +17,22 @@ ee-preflight <path/to/execution-environment.yml> [options]
 
 Options:
   --fix                Automatically add discovered missing deps to the EE definition files
+  --build              Run ansible-builder build after all layers pass
+  --tag TAG            Image tag for --build (default: <ee-name>:latest)
   --venv PATH          Use this venv path (kept after run for inspection)
   --keep-venv          Keep the default temp venv after run
   --container-test     Enable layer 3: test wheel builds inside the base image
   --json               Output structured JSON instead of human-readable text
   --verbose            Show passing checks, not just failures
 ```
+
+### Combining flags
+
+`--fix --build` is the full end-to-end workflow: validate, fix what can be auto-fixed, then build. If `--fix` applies changes, the layers re-run to verify the fixes before proceeding to `--build`. If errors remain after `--fix` (e.g., version conflicts that require user judgment), the build is skipped and errors are reported.
+
+`--build` without `--fix` only builds if all layers pass as-is.
+
+`--build` passes `--build-arg` for any `ARG` declarations detected in Layer 0 that have matching env vars (e.g., `ARG AH_TOKEN` → `--build-arg AH_TOKEN=$AH_TOKEN`).
 
 ## Architecture
 
