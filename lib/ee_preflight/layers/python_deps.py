@@ -1,16 +1,28 @@
 from __future__ import annotations
 
-import subprocess
+import re
 from pathlib import Path
 
 from ..models import DepFormat, Finding, LayerResult, Severity, ValidateContext
+
+ADE_ENV_DIR = ".ansible-dev-environment"
+DISCOVERED_PYTHON = "discovered_requirements.txt"
+DISCOVERED_SYSTEM = "discovered_bindep.txt"
 
 
 def validate(ctx: ValidateContext) -> LayerResult:
     findings: list[Finding] = []
 
-    _run_ade_check(ctx, findings)
-    discovered_python, discovered_system = run_introspect(ctx, findings)
+    discovered_python = _read_discovered_python(ctx)
+    discovered_system = _read_discovered_system(ctx)
+
+    if not discovered_python and not discovered_system:
+        findings.append(Finding(
+            severity=Severity.INFO,
+            message="No discovered dependencies found (ade may not have completed introspection)",
+        ))
+        return LayerResult(name="python_deps", status="pass", findings=findings)
+
     _diff_python_deps(ctx, discovered_python, findings)
     _diff_system_deps(ctx, discovered_system, findings)
 
@@ -18,155 +30,148 @@ def validate(ctx: ValidateContext) -> LayerResult:
     return LayerResult(name="python_deps", status=status, findings=findings)
 
 
-def _run_ade_check(ctx: ValidateContext, findings: list[Finding]) -> None:
-    try:
-        result = subprocess.run(
-            ["ade", "check", "--venv", str(ctx.venv_path), "-v"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            output = result.stdout + result.stderr
-            for line in output.splitlines():
-                line = line.strip()
-                if "missing" in line.lower() or "conflict" in line.lower():
-                    findings.append(Finding(
-                        severity=Severity.ERROR,
-                        message=f"ade check: {line}",
-                    ))
-    except FileNotFoundError:
-        findings.append(Finding(
-            severity=Severity.ERROR,
-            message="ade not found",
-            fix="pip install ansible-dev-environment",
-        ))
-    except subprocess.TimeoutExpired:
-        findings.append(Finding(
-            severity=Severity.WARNING,
-            message="ade check timed out after 120s",
-        ))
+def _read_discovered_python(ctx: ValidateContext) -> list[dict]:
+    """Read ade's discovered_requirements.txt, return list of {dep, source}."""
+    path = ctx.venv_path / ADE_ENV_DIR / DISCOVERED_PYTHON
+    if not path.exists():
+        return []
 
-
-def run_introspect(
-    ctx: ValidateContext, findings: list[Finding]
-) -> tuple[list[str], list[str]]:
-    discovered_python: list[str] = []
-    discovered_system: list[str] = []
-
-    site_packages = _find_site_packages(ctx.venv_path)
-    if not site_packages:
-        findings.append(Finding(
-            severity=Severity.WARNING,
-            message="Could not locate venv site-packages for introspection",
-        ))
-        return discovered_python, discovered_system
-
-    try:
-        result = subprocess.run(
-            ["ansible-builder", "introspect", str(site_packages)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            discovered_python, discovered_system = _parse_introspect(result.stdout)
-    except FileNotFoundError:
-        findings.append(Finding(
-            severity=Severity.ERROR,
-            message="ansible-builder not found",
-            fix="pip install ansible-builder",
-        ))
-    except subprocess.TimeoutExpired:
-        findings.append(Finding(
-            severity=Severity.WARNING,
-            message="ansible-builder introspect timed out",
-        ))
-
-    return discovered_python, discovered_system
-
-
-def _find_site_packages(venv_path: Path) -> Path | None:
-    lib_dir = venv_path / "lib"
-    if not lib_dir.exists():
-        return None
-    for pydir in sorted(lib_dir.iterdir(), reverse=True):
-        sp = pydir / "site-packages"
-        if sp.exists():
-            return sp
-    return None
-
-
-def _parse_introspect(output: str) -> tuple[list[str], list[str]]:
-    python_deps: list[str] = []
-    system_deps: list[str] = []
-    section = None
-
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("python:"):
-            section = "python"
+    entries: list[dict] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        if stripped.startswith("system:"):
-            section = "system"
-            continue
-        if not stripped or stripped.startswith("#"):
-            continue
+        source = None
+        if "# from collection" in line:
+            parts = line.split("# from collection")
+            line = parts[0].strip()
+            source = parts[1].strip()
+        entries.append({"dep": line, "source": source})
+    return entries
 
-        if section == "python" and stripped.startswith("- "):
-            dep = stripped[2:].strip().strip("'\"")
-            dep = dep.split("#")[0].strip()
-            if dep:
-                python_deps.append(dep)
-        elif section == "system" and stripped.startswith("- "):
-            dep = stripped[2:].strip().strip("'\"")
-            dep = dep.split("#")[0].strip()
-            if dep:
-                system_deps.append(dep)
 
-    return python_deps, system_deps
+def _read_discovered_system(ctx: ValidateContext) -> list[dict]:
+    """Read ade's discovered_bindep.txt, return list of {dep, source, platforms}."""
+    path = ctx.venv_path / ADE_ENV_DIR / DISCOVERED_SYSTEM
+    if not path.exists():
+        return []
+
+    entries: list[dict] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        source = None
+        if "# from collection" in line:
+            parts = line.split("# from collection")
+            line = parts[0].strip()
+            source = parts[1].strip()
+
+        pkg_name = line.split()[0]
+        platforms = re.findall(r"platform:(\S+)", line)
+        entries.append({
+            "dep": line,
+            "pkg_name": pkg_name,
+            "source": source,
+            "platforms": platforms,
+        })
+    return entries
 
 
 def _diff_python_deps(
     ctx: ValidateContext,
-    discovered: list[str],
+    discovered: list[dict],
     findings: list[Finding],
 ) -> None:
-    declared = read_declared_python(ctx)
+    declared = _read_declared_python(ctx)
     declared_names = {_pkg_name(d) for d in declared}
 
-    for dep in discovered:
-        name = _pkg_name(dep)
-        if name and name not in declared_names:
-            findings.append(Finding(
-                severity=Severity.WARNING,
-                message=f"Undeclared Python dep: {dep}",
-                fix=f"Add '{dep}' to python requirements",
-                source="discovered by ansible-builder introspect",
-            ))
+    seen: set[str] = set()
+    for entry in discovered:
+        name = _pkg_name(entry["dep"])
+        if not name or name in declared_names or name in seen:
+            continue
+        seen.add(name)
+
+        findings.append(Finding(
+            severity=Severity.INFO,
+            message=f"Transitive Python dep: {entry['dep']}",
+            source=f"from collection {entry['source']}" if entry["source"] else None,
+        ))
 
 
 def _diff_system_deps(
     ctx: ValidateContext,
-    discovered: list[str],
+    discovered: list[dict],
     findings: list[Finding],
 ) -> None:
-    declared = read_declared_system(ctx)
+    declared = _read_declared_system(ctx)
     declared_names = {line.split()[0] for line in declared if line.strip()}
 
-    for dep in discovered:
-        pkg_name = dep.split()[0]
-        if pkg_name not in declared_names:
-            bindep_entry = dep if "[" in dep else f"{dep} [platform:rpm]"
-            findings.append(Finding(
-                severity=Severity.WARNING,
-                message=f"Undeclared system dep: {pkg_name}",
-                fix=f"Add '{bindep_entry}' to bindep.txt",
-                source="discovered by ansible-builder introspect",
-            ))
+    target_platform = _detect_target_platform(ctx)
+
+    seen: set[str] = set()
+    for entry in discovered:
+        pkg_name = entry["pkg_name"]
+        platforms = entry["platforms"]
+
+        if pkg_name in declared_names or pkg_name in seen:
+            continue
+
+        if platforms and not _matches_platform(platforms, target_platform):
+            continue
+
+        seen.add(pkg_name)
+
+        findings.append(Finding(
+            severity=Severity.WARNING,
+            message=f"Undeclared system dep: {pkg_name}",
+            fix=f"Add '{entry['dep']}' to bindep.txt",
+            source=f"from collection {entry['source']}" if entry["source"] else None,
+        ))
+
+
+def _detect_target_platform(ctx: ValidateContext) -> str:
+    """Infer the target platform from the base image name."""
+    image = ctx.ee.base_image.lower()
+    if "rhel-9" in image or "rhel9" in image:
+        return "rhel-9"
+    if "rhel-8" in image or "rhel8" in image:
+        return "rhel-8"
+    if "centos-9" in image or "centos9" in image:
+        return "centos-9"
+    if "centos-8" in image or "centos8" in image:
+        return "centos-8"
+    if "fedora" in image:
+        return "fedora"
+    if "debian" in image or "ubuntu" in image:
+        return "debian"
+    return "rpm"
+
+
+def _matches_platform(platforms: list[str], target: str) -> bool:
+    """Check if any of the bindep platform tags match our target."""
+    for p in platforms:
+        if p == target:
+            return True
+        if p == "rpm" and target in ("rhel-8", "rhel-9", "centos-8", "centos-9", "fedora"):
+            return True
+        if p == "redhat" and target in ("rhel-8", "rhel-9", "centos-8", "centos-9"):
+            return True
+        if p == "dpkg" and target in ("debian", "ubuntu"):
+            return True
+    return False
 
 
 def read_declared_python(ctx: ValidateContext) -> list[str]:
+    return _read_declared_python(ctx)
+
+
+def read_declared_system(ctx: ValidateContext) -> list[str]:
+    return _read_declared_system(ctx)
+
+
+def _read_declared_python(ctx: ValidateContext) -> list[str]:
     if ctx.ee.python is None:
         return []
     if ctx.ee.python.format == DepFormat.FILE and ctx.ee.python.file_path:
@@ -181,7 +186,7 @@ def read_declared_python(ctx: ValidateContext) -> list[str]:
     return []
 
 
-def read_declared_system(ctx: ValidateContext) -> list[str]:
+def _read_declared_system(ctx: ValidateContext) -> list[str]:
     if ctx.ee.system is None:
         return []
     if ctx.ee.system.format == DepFormat.FILE and ctx.ee.system.file_path:
