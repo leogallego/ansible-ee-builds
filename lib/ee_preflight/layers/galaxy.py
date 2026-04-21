@@ -213,20 +213,34 @@ def _parse_python_build_errors(output: str) -> list[Finding]:
     missing_file_patterns = [
         (r"fatal error: (\S+\.h): No such file or directory", "header"),
         (r"(\S+): command not found", "command"),
+        (r"Package '(\S+)' not found", "pkgconfig"),
         (r"Package (\S+) was not found in the pkg-config search path", "pkgconfig"),
     ]
 
+    seen: set[str] = set()
     for pattern, kind in missing_file_patterns:
         for match in re.finditer(pattern, output):
             missing = match.group(1)
-            findings.append(Finding(
-                severity=Severity.WARNING,
-                message=f"Python dep build failed: {missing} not found ({kind})",
-                fix=f"Add the package providing {missing} to bindep.txt",
-                source="detected during ade install (Python dep compilation)",
-            ))
+            if missing in seen:
+                continue
+            seen.add(missing)
 
-    # Catch generic build failures if no specific pattern matched
+            rpm = _resolve_rpm(missing, kind)
+            if rpm:
+                findings.append(Finding(
+                    severity=Severity.WARNING,
+                    message=f"Python dep build failed: {missing} not found ({kind})",
+                    fix=f"Add '{rpm} [platform:rpm]' to bindep.txt",
+                    source="detected during ade install (Python dep compilation)",
+                ))
+            else:
+                findings.append(Finding(
+                    severity=Severity.WARNING,
+                    message=f"Python dep build failed: {missing} not found ({kind})",
+                    fix=f"Find the RPM providing {missing} and add it to bindep.txt",
+                    source="detected during ade install (Python dep compilation)",
+                ))
+
     if not findings:
         for line in output.splitlines():
             if "Failed to build" in line or "Failed building wheel" in line:
@@ -239,3 +253,33 @@ def _parse_python_build_errors(output: str) -> list[Finding]:
                 ))
 
     return findings
+
+
+def _resolve_rpm(missing: str, kind: str) -> str | None:
+    """Try to resolve the missing file/command to an RPM package name."""
+    if missing == "Python.h":
+        return "python3-devel"
+
+    search = f"*/{missing}" if kind == "header" else f"*/{missing}"
+    if kind == "pkgconfig":
+        search = f"*/pkgconfig/{missing}.pc"
+
+    try:
+        result = subprocess.run(
+            ["dnf", "provides", search],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("Last") or line.startswith("="):
+                    continue
+                match = re.match(r"^(\S+?)-\d", line)
+                if match:
+                    return match.group(1)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return None
