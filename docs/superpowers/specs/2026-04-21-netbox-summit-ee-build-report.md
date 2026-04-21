@@ -29,13 +29,13 @@
 |---------|-------|--------------------|
 | Missing `--build-arg` | Layer 0 (Pre-checks) | **Yes** — detects `ARG AH_TOKEN` in build steps without `$AH_TOKEN` set in the environment |
 | `community.general` vs `fedora.linux_system_roles` conflict | Layer 1 (Galaxy) | **Yes** — `ade install` would report the version conflict |
-| AH 504 timeout | — | No (transient network issue) |
+| AH 504 timeout | Layer 1 (Galaxy) | **Yes** — auto-retry with exponential backoff on transient HTTP errors (504, 502, 429, timeouts) |
 | Missing `systemd-devel` | Layer 2/3 | **Yes** — introspection discovers `systemd-python`, layer 3 catches the missing `-devel` |
 | Missing `krb5-devel` | Layer 2/3 | **Yes** — introspection discovers `gssapi` via `ansible.eda → aiokafka[gssapi]`, layer 3 catches it |
 | Missing `python3-devel` | Layer 3 | **Yes** — wheel build test inside the base image would fail the same way |
 | Wrong `python3-devel` version | Layer 3 | **Yes** — running inside the actual base image would detect the 3.9 vs 3.12 mismatch and `dnf provides` would suggest `python3.12-devel` |
 
-**6 of 7 failures would have been caught in a single preflight run, before the first `ansible-builder build`.** The only uncatchable failure is the transient AH 504 timeout.
+**All 7 failures would have been caught in a single preflight run, before the first `ansible-builder build`.** Transient HTTP errors (like the AH 504) are auto-retried with exponential backoff.
 
 ## Detailed Timeline
 

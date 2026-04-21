@@ -142,11 +142,13 @@ class LayerResult:
 4. Parse output for errors: version conflicts, unreachable servers, auth failures, missing collections.
 5. Report ALL errors found, not just the first.
 
+**Transient error handling:** If `ade install` fails with a transient HTTP error (504, 502, 429, connection timeout, connection refused), the layer retries up to 3 times with exponential backoff (5s, 15s, 45s). If all retries fail, the error is reported as a finding with the retry history.
+
 **Findings reported:**
 - Collection version conflicts (e.g., `community.general:12.6.0` conflicts with `fedora.linux_system_roles` requirement `<12.0.0`)
 - Galaxy server auth failures
 - Collections not found on any configured server
-- Transient errors (504 timeouts — flagged as warnings with "retry" suggestion)
+- Transient errors that persisted after 3 retries
 
 **Gate:** Layer 2 is skipped if layer 1 fails (collections must be installed to introspect deps).
 
