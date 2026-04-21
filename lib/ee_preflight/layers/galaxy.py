@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -18,28 +19,43 @@ TRANSIENT_PATTERNS = [
     "Gateway Time-out",
 ]
 
+PYTHON_BUILD_PATTERNS = [
+    "No module named",
+    "command not found",
+    "No such file or directory",
+    "Failed building wheel",
+    "Failed to build",
+    "pkg-config search path",
+    "Cannot find",
+]
+
 MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
 
 
-def validate(ctx: ValidateContext) -> LayerResult:
+def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
+    """Returns (layer1_result, python_build_findings).
+
+    Python build findings are separated so the runner can attach them
+    to Layer 2 instead of failing Layer 1.
+    """
     findings: list[Finding] = []
+    python_findings: list[Finding] = []
 
     reqs_path = _get_requirements_path(ctx, findings)
     if reqs_path is None:
-        return LayerResult(name="galaxy", status="fail", findings=findings)
+        return LayerResult(name="galaxy", status="fail", findings=findings), []
 
     env = _build_env(ctx)
 
     for attempt in range(MAX_RETRIES):
         try:
-            collections_path = ctx.venv_path / "collections"
-            collections_path.mkdir(parents=True, exist_ok=True)
             result = subprocess.run(
                 [
-                    "ansible-galaxy", "collection", "install",
+                    "ade", "install",
                     "-r", str(reqs_path),
-                    "-p", str(collections_path),
+                    "--venv", str(ctx.venv_path),
+                    "--im", "none",
                     "-v",
                 ],
                 capture_output=True,
@@ -52,17 +68,17 @@ def validate(ctx: ValidateContext) -> LayerResult:
                 severity=Severity.ERROR,
                 message="Galaxy resolution timed out after 600s",
             ))
-            return LayerResult(name="galaxy", status="fail", findings=findings)
-
-        if result.returncode == 0:
-            installed = _count_collections(result.stdout + result.stderr)
-            findings.append(Finding(
-                severity=Severity.INFO,
-                message=f"{installed} collections resolved",
-            ))
-            return LayerResult(name="galaxy", status="pass", findings=findings)
+            return LayerResult(name="galaxy", status="fail", findings=findings), []
 
         output = result.stdout + result.stderr
+
+        if result.returncode == 0:
+            installed = _count_collections(output)
+            findings.append(Finding(
+                severity=Severity.INFO,
+                message=f"{installed} collections resolved and installed",
+            ))
+            return LayerResult(name="galaxy", status="pass", findings=findings), []
 
         if _is_transient(output) and attempt < MAX_RETRIES - 1:
             wait = BACKOFF_SECONDS[attempt]
@@ -73,10 +89,38 @@ def validate(ctx: ValidateContext) -> LayerResult:
             time.sleep(wait)
             continue
 
-        _parse_errors(output, findings)
-        return LayerResult(name="galaxy", status="fail", findings=findings)
+        # Separate collection errors from Python build failures
+        collection_errors = _parse_collection_errors(output)
+        python_build_errors = _parse_python_build_errors(output)
 
-    return LayerResult(name="galaxy", status="fail", findings=findings)
+        if collection_errors:
+            findings.extend(collection_errors)
+            return LayerResult(name="galaxy", status="fail", findings=findings), []
+
+        if python_build_errors:
+            # Collections resolved but Python deps failed to build —
+            # that's a Layer 2 finding, not a Layer 1 failure
+            installed = _count_collections(output)
+            findings.append(Finding(
+                severity=Severity.INFO,
+                message=f"{installed} collections resolved (Python dep build issues detected)",
+            ))
+            return (
+                LayerResult(name="galaxy", status="pass", findings=findings),
+                python_build_errors,
+            )
+
+        # Unknown failure
+        last_lines = output.strip().splitlines()[-5:]
+        findings.append(Finding(
+            severity=Severity.ERROR,
+            message="Galaxy resolution failed: " + " | ".join(
+                l.strip() for l in last_lines if l.strip()
+            ),
+        ))
+        return LayerResult(name="galaxy", status="fail", findings=findings), []
+
+    return LayerResult(name="galaxy", status="fail", findings=findings), []
 
 
 def _get_requirements_path(
@@ -92,8 +136,9 @@ def _get_requirements_path(
     if ctx.ee.galaxy.format == DepFormat.FILE:
         return ctx.ee.galaxy.file_path
 
-    tmp = ctx.venv_path.parent / "inline-requirements.yml"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tmp_dir / "inline-requirements.yml"
     with open(tmp, "w") as f:
         yaml.dump({"collections": ctx.ee.galaxy.entries}, f)
     return tmp
@@ -104,7 +149,9 @@ def _build_env(ctx: ValidateContext) -> dict:
     env.pop("ANSIBLE_CONFIG", None)
     ah_token = os.environ.get("AH_TOKEN")
     if ah_token:
-        env["ANSIBLE_GALAXY_SERVER_LIST"] = "automation_hub_certified,automation_hub_validated,release_galaxy"
+        env["ANSIBLE_GALAXY_SERVER_LIST"] = (
+            "automation_hub_certified,automation_hub_validated,release_galaxy"
+        )
         env["ANSIBLE_GALAXY_SERVER_AUTOMATION_HUB_CERTIFIED_URL"] = (
             "https://console.redhat.com/api/automation-hub/content/published/"
         )
@@ -135,7 +182,9 @@ def _count_collections(output: str) -> int:
     return count
 
 
-def _parse_errors(output: str, findings: list[Finding]) -> None:
+def _parse_collection_errors(output: str) -> list[Finding]:
+    findings: list[Finding] = []
+
     if "Could not satisfy" in output or "Failed to resolve" in output:
         for line in output.splitlines():
             line = line.strip()
@@ -152,17 +201,41 @@ def _parse_errors(output: str, findings: list[Finding]) -> None:
             fix="Check AH_TOKEN or ansible.cfg credentials",
         ))
 
-    if "No matching distribution" in output:
+    return findings
+
+
+def _parse_python_build_errors(output: str) -> list[Finding]:
+    findings: list[Finding] = []
+
+    if not any(p in output for p in PYTHON_BUILD_PATTERNS):
+        return findings
+
+    missing_file_patterns = [
+        (r"fatal error: (\S+\.h): No such file or directory", "header"),
+        (r"(\S+): command not found", "command"),
+        (r"Package (\S+) was not found in the pkg-config search path", "pkgconfig"),
+    ]
+
+    for pattern, kind in missing_file_patterns:
+        for match in re.finditer(pattern, output):
+            missing = match.group(1)
+            findings.append(Finding(
+                severity=Severity.WARNING,
+                message=f"Python dep build failed: {missing} not found ({kind})",
+                fix=f"Add the package providing {missing} to bindep.txt",
+                source="detected during ade install (Python dep compilation)",
+            ))
+
+    # Catch generic build failures if no specific pattern matched
+    if not findings:
         for line in output.splitlines():
-            if "No matching distribution" in line:
+            if "Failed to build" in line or "Failed building wheel" in line:
+                pkg = line.strip().split("'")[1] if "'" in line else "unknown"
                 findings.append(Finding(
-                    severity=Severity.ERROR,
-                    message=line.strip(),
+                    severity=Severity.WARNING,
+                    message=f"Python dep failed to build: {pkg}",
+                    fix="Check system -devel packages required for compilation",
+                    source="detected during ade install",
                 ))
 
-    if not any(f.severity == Severity.ERROR for f in findings):
-        last_lines = output.strip().splitlines()[-5:]
-        findings.append(Finding(
-            severity=Severity.ERROR,
-            message="Galaxy resolution failed: " + " | ".join(l.strip() for l in last_lines if l.strip()),
-        ))
+    return findings

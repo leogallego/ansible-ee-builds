@@ -30,12 +30,7 @@ def run(
         path_hash = hashlib.md5(str(ee_path).encode()).hexdigest()[:8]
         venv_path = Path("tmp") / f"ee-preflight-{path_hash}"
 
-    if not (venv_path / "bin" / "python").exists():
-        venv_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [sys.executable, "-m", "venv", str(venv_path)],
-            check=True,
-        )
+    venv_path.parent.mkdir(parents=True, exist_ok=True)
 
     ctx = ValidateContext(
         ee=ee,
@@ -63,7 +58,7 @@ def run(
             ])
             return results
 
-        r1 = galaxy.validate(ctx)
+        r1, python_build_findings = galaxy.validate(ctx)
         results.append(r1)
 
         if r1.has_errors:
@@ -73,6 +68,10 @@ def run(
             ])
         else:
             r2 = python_deps.validate(ctx)
+            r2.findings.extend(python_build_findings)
+            if python_build_findings and not r2.has_errors:
+                if any(f.severity == Severity.ERROR for f in python_build_findings):
+                    r2.status = "fail"
             results.append(r2)
 
             r3 = system_deps.validate(ctx)
