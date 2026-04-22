@@ -28,7 +28,9 @@ def run(
 
     if venv_path is None:
         path_hash = hashlib.md5(str(ee_path).encode()).hexdigest()[:8]
-        venv_path = Path("tmp") / f"ee-preflight-{path_hash}"
+        venv_path = Path("tmp").resolve() / f"ee-preflight-{path_hash}"
+    else:
+        venv_path = venv_path.resolve()
 
     venv_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -148,7 +148,7 @@ def _build_env(ctx: ValidateContext) -> dict:
     env = os.environ.copy()
     env.pop("ANSIBLE_CONFIG", None)
     # Keep uv cache local to avoid read-only filesystem issues in sandboxed environments
-    env.setdefault("UV_CACHE_DIR", str(Path("tmp") / "uv-cache"))
+    env.setdefault("UV_CACHE_DIR", str(Path("tmp").resolve() / "uv-cache"))
     ah_token = os.environ.get("AH_TOKEN")
     if ah_token:
         env["ANSIBLE_GALAXY_SERVER_LIST"] = (
