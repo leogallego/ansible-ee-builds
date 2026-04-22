@@ -8,8 +8,11 @@ from ..models import Finding, LayerResult, Severity, ValidateContext
 MISSING_FILE_PATTERNS = [
     (r"fatal error: (\S+\.h): No such file or directory", "header"),
     (r"(\S+): command not found", "command"),
+    (r"Package '(\S+)' not found", "pkgconfig"),
     (r"Package (\S+) was not found in the pkg-config search path", "pkgconfig"),
     (r"Cannot find (\S+)", "library"),
+    (r"(libxml2|libxslt) development packages are", "devpkg"),
+    (r"Failed to build '(\S+)'", "wheel"),
 ]
 
 
@@ -54,7 +57,7 @@ def validate(ctx: ValidateContext) -> LayerResult:
     bindep_install = _get_bindep_install_cmd(ctx)
 
     for pkg in source_pkgs:
-        _test_wheel_build(runtime, image, pkg, bindep_install, python_version, findings)
+        _test_wheel_build(ctx, runtime, image, pkg, bindep_install, python_version, findings)
 
     status = "fail" if any(f.severity == Severity.ERROR for f in findings) else "pass"
     return LayerResult(name="system_deps", status=status, findings=findings)
@@ -71,10 +74,19 @@ def _detect_python_version(runtime: ContainerRuntime, image: str) -> str:
 
 
 def _get_discovered_python(ctx: ValidateContext) -> list[str]:
-    from .python_deps import run_introspect
-    findings_ignored: list[Finding] = []
-    python_deps, _ = run_introspect(ctx, findings_ignored)
-    return python_deps
+    """Read Python deps from ade's discovered_requirements.txt."""
+    path = ctx.venv_path / ".ansible-dev-environment" / "discovered_requirements.txt"
+    if not path.exists():
+        return []
+    deps: list[str] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        dep = line.split("#")[0].strip()
+        if dep:
+            deps.append(dep)
+    return deps
 
 
 def _find_source_only_packages(python_deps: list[str]) -> list[str]:
@@ -83,10 +95,12 @@ def _find_source_only_packages(python_deps: list[str]) -> list[str]:
         "ovirt_engine_sdk_python", "python_ldap", "pynacl",
     }
     source_pkgs: list[str] = []
+    seen: set[str] = set()
     for dep in python_deps:
         name = dep.split(">=")[0].split("==")[0].split("<")[0].split("[")[0].strip()
         normalized = name.lower().replace("-", "_")
-        if normalized in known_source_only:
+        if normalized in known_source_only and normalized not in seen:
+            seen.add(normalized)
             source_pkgs.append(dep)
     return source_pkgs
 
@@ -102,6 +116,7 @@ def _get_bindep_install_cmd(ctx: ValidateContext) -> str:
 
 
 def _test_wheel_build(
+    ctx: ValidateContext,
     runtime: ContainerRuntime,
     image: str,
     pkg: str,
@@ -110,11 +125,15 @@ def _test_wheel_build(
     findings: list[Finding],
 ) -> None:
     pkg_name = pkg.split(">=")[0].split("==")[0].split("<")[0].strip()
+    pkgmgr = ctx.ee.options.get("package_manager_path", "/usr/bin/microdnf")
+    pycmd = f"python{python_version}"
 
     cmd = (
         f"{bindep_install} && "
-        f"pip install --upgrade pip setuptools wheel && "
-        f"pip wheel --no-binary :all: '{pkg}' -w /tmp/wheels"
+        f"{pkgmgr} install -y python3-pip python3-devel gcc 2>/dev/null; "
+        f"{pycmd} -m ensurepip 2>/dev/null; "
+        f"{pycmd} -m pip install --upgrade pip setuptools wheel && "
+        f"{pycmd} -m pip wheel --no-binary :all: '{pkg}' -w /tmp/wheels"
     )
 
     result = runtime.run(image, cmd, timeout=180)
@@ -169,6 +188,17 @@ def _find_providing_rpm(
 ) -> str | None:
     if missing_file == "Python.h":
         return f"python{python_version}-devel"
+
+    # Known library-to-devel mappings
+    known_devpkgs = {
+        "libxml2": "libxml2-devel",
+        "libxslt": "libxslt-devel",
+        "libsystemd": "systemd-devel",
+        "libffi": "libffi-devel",
+        "openssl": "openssl-devel",
+    }
+    if missing_file in known_devpkgs:
+        return known_devpkgs[missing_file]
 
     result = runtime.run(
         image,

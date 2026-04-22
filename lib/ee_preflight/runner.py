@@ -74,6 +74,12 @@ def run(
                     r2.status = "fail"
             results.append(r2)
 
+            # Auto-trigger Layer 3 if ade hit Python build failures —
+            # ade stops at the first failure, so we need the container
+            # to test all source-only packages independently
+            if python_build_findings:
+                ctx.container_test = True
+
             r3 = system_deps.validate(ctx)
             results.append(r3)
 
