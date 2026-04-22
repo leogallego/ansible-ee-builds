@@ -166,19 +166,19 @@ def _test_wheel_build(
     missing_file = _extract_missing_file(output)
 
     if missing_file:
-        rpm = _find_providing_rpm(runtime, image, missing_file, python_version)
-        if rpm:
+        pkg_provider = _find_providing_package(runtime, image, missing_file, python_version)
+        if pkg_provider:
             findings.append(Finding(
                 severity=Severity.ERROR,
                 message=f"{pkg_name} failed to build: {missing_file} not found",
-                fix=f"Add '{rpm} [platform:rpm]' to bindep.txt",
+                fix=f"Add '{pkg_provider}' to bindep.txt",
                 source=f"required by {pkg_name}",
             ))
         else:
             findings.append(Finding(
                 severity=Severity.ERROR,
                 message=f"{pkg_name} failed to build: {missing_file} not found",
-                fix=f"Manually find the RPM providing {missing_file}",
+                fix=f"Find the package providing {missing_file} for your base image and add it to bindep.txt",
                 source=f"required by {pkg_name}",
             ))
     else:
@@ -197,7 +197,7 @@ def _extract_missing_file(output: str) -> str | None:
     return None
 
 
-def _find_providing_rpm(
+def _find_providing_package(
     runtime: ContainerRuntime,
     image: str,
     missing_file: str,
@@ -206,26 +206,32 @@ def _find_providing_rpm(
     if missing_file == "Python.h":
         return f"python{python_version}-devel"
 
-    # Known library-to-devel mappings
-    known_devpkgs = {
-        "libxml2": "libxml2-devel",
-        "libxslt": "libxslt-devel",
-        "libsystemd": "systemd-devel",
-        "libffi": "libffi-devel",
-        "openssl": "openssl-devel",
-    }
-    if missing_file in known_devpkgs:
-        return known_devpkgs[missing_file]
-
+    # Try dnf provides inside the container (install dnf if needed)
+    search = f"*/pkgconfig/{missing_file}.pc" if "." not in missing_file else f"*/{missing_file}"
     result = runtime.run(
         image,
-        f"dnf provides '*/{missing_file}' 2>/dev/null || yum provides '*/{missing_file}' 2>/dev/null",
+        f"(microdnf install -y dnf 2>/dev/null || true) && "
+        f"dnf provides '{search}' 2>/dev/null",
+        timeout=120,
     )
     if result.returncode == 0 and result.stdout.strip():
         for line in result.stdout.splitlines():
             line = line.strip()
-            if line and not line.startswith("Last") and not line.startswith("=") and "-" in line:
-                rpm_name = re.split(r"[-:]\d", line)[0]
-                if rpm_name:
-                    return rpm_name
+            if not line or line.startswith("Last") or line.startswith("=") or line.startswith("Repo"):
+                continue
+            match = re.match(r"^(\S+?)-\d", line)
+            if match:
+                return match.group(1)
+
+    # Try apt-file for Debian-based containers
+    result = runtime.run(
+        image,
+        f"apt-file search '{missing_file}' 2>/dev/null | head -1",
+        timeout=60,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        pkg = result.stdout.strip().split(":")[0]
+        if pkg:
+            return pkg
+
     return None

@@ -235,22 +235,12 @@ def _parse_python_build_errors(output: str) -> list[Finding]:
             if missing in seen:
                 continue
             seen.add(missing)
-
-            rpm = _resolve_rpm(missing, kind)
-            if rpm:
-                findings.append(Finding(
-                    severity=Severity.WARNING,
-                    message=f"Python dep build failed: {missing} not found ({kind})",
-                    fix=f"Add '{rpm} [platform:rpm]' to bindep.txt",
-                    source="detected during ade install (Python dep compilation)",
-                ))
-            else:
-                findings.append(Finding(
-                    severity=Severity.WARNING,
-                    message=f"Python dep build failed: {missing} not found ({kind})",
-                    fix=f"Find the RPM providing {missing} and add it to bindep.txt",
-                    source="detected during ade install (Python dep compilation)",
-                ))
+            findings.append(Finding(
+                severity=Severity.WARNING,
+                message=f"Python dep build failed: {missing} not found ({kind})",
+                fix="Layer 3 container test will resolve the exact package",
+                source="detected during ade install",
+            ))
 
     if not findings:
         for line in output.splitlines():
@@ -259,38 +249,8 @@ def _parse_python_build_errors(output: str) -> list[Finding]:
                 findings.append(Finding(
                     severity=Severity.WARNING,
                     message=f"Python dep failed to build: {pkg}",
-                    fix="Check system -devel packages required for compilation",
+                    fix="Layer 3 container test will resolve the exact package",
                     source="detected during ade install",
                 ))
 
     return findings
-
-
-def _resolve_rpm(missing: str, kind: str) -> str | None:
-    """Try to resolve the missing file/command to an RPM package name."""
-    if missing == "Python.h":
-        return "python3-devel"
-
-    search = f"*/{missing}" if kind == "header" else f"*/{missing}"
-    if kind == "pkgconfig":
-        search = f"*/pkgconfig/{missing}.pc"
-
-    try:
-        result = subprocess.run(
-            ["dnf", "provides", search],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if not line or line.startswith("Last") or line.startswith("="):
-                    continue
-                match = re.match(r"^(\S+?)-\d", line)
-                if match:
-                    return match.group(1)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-
-    return None
