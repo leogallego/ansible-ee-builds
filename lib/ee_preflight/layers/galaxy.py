@@ -71,13 +71,22 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
             return LayerResult(name="galaxy", status="fail", findings=findings), []
 
         output = result.stdout + result.stderr
+        collections_installed = "Installed collections include:" in output
 
-        if result.returncode == 0:
+        if result.returncode == 0 or collections_installed:
             installed = _count_collections(output)
+            python_build_errors = _parse_python_build_errors(output) if result.returncode != 0 else []
+
             findings.append(Finding(
                 severity=Severity.INFO,
                 message=f"{installed} collections resolved and installed",
             ))
+
+            if python_build_errors:
+                return (
+                    LayerResult(name="galaxy", status="pass", findings=findings),
+                    python_build_errors,
+                )
             return LayerResult(name="galaxy", status="pass", findings=findings), []
 
         if _is_transient(output) and attempt < MAX_RETRIES - 1:
