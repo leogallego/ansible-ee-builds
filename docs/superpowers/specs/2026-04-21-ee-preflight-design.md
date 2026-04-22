@@ -4,11 +4,11 @@
 
 Building Ansible Execution Environments with `ansible-builder` is a slow trial-and-error loop. Each failure — collection version conflicts, missing Python deps, missing system `-devel` packages — requires a full container rebuild cycle (5-10+ minutes) to discover. Failures surface one at a time, so multiple issues mean multiple rebuild cycles.
 
-In a real session building `netbox-summit-2026-ee`, we hit 5 sequential failures before a successful build: a Galaxy version conflict, a missing build arg, an AH timeout (transient), missing `systemd-devel`, missing `krb5-devel`, and missing `python3.12-devel`. A pre-build validation tool would have caught most of these in seconds.
+In a real session building `netbox-summit-2026-ee`, we hit 7 sequential failures before a successful build: a Galaxy version conflict, a missing build arg, an AH timeout (transient), missing `systemd-devel`, missing `krb5-devel`, and missing `python3.12-devel`. A pre-build validation tool catches 6 of 7 in a single pass.
 
 ## Solution
 
-A Python CLI tool that validates an `execution-environment.yml` definition before running `ansible-builder`. It runs three validation layers in sequence, reporting all findings per layer before proceeding. If a layer fails, subsequent layers that depend on it are skipped.
+A Python CLI tool that validates an `execution-environment.yml` definition before running `ansible-builder`. It runs four validation layers (0-3) in sequence, reporting all findings per layer before proceeding. If a layer fails, subsequent layers that depend on it are skipped. Layer 3 (container wheel test) auto-triggers when Layer 1 detects Python build failures — no manual opt-in needed.
 
 ## CLI Interface
 
@@ -143,14 +143,15 @@ class LayerResult:
 
 ## Layer 1: Galaxy Resolution
 
-**Purpose:** Verify all collections can be resolved and installed without version conflicts.
+**Purpose:** Verify all collections can be resolved and installed, along with their Python dependencies.
 
 **Implementation:**
-1. Parse `execution-environment.yml` to extract the collections requirements file path.
-2. Set up auth: if `AH_TOKEN` env var is set, configure `ANSIBLE_GALAXY_SERVER_*` env vars for the `ade` subprocess. Otherwise, rely on the user's existing `ansible.cfg` or env config.
-3. Run `ade install -r <requirements-file> --venv <path>`.
-4. Parse output for errors: version conflicts, unreachable servers, auth failures, missing collections.
-5. Report ALL errors found, not just the first.
+1. Parse `execution-environment.yml` to extract the collections requirements file path (or write inline collections to a temp file).
+2. Set up auth: if `AH_TOKEN` env var is set, configure `ANSIBLE_GALAXY_SERVER_*` env vars (including certified and validated hub URLs). Otherwise, rely on the user's existing env config.
+3. Run `ade install -r <requirements-file> --venv <path> --im none`. `ade` creates the venv, installs collections, discovers transitive Python deps, and attempts to install them.
+4. Parse output: separate collection-level errors (Layer 1 failures) from Python build failures (passed to Layer 2 as warnings, auto-triggers Layer 3).
+5. Report ALL collection errors found, not just the first.
+6. `ade` may return non-zero even when collections installed successfully (e.g., venv not activated). Check for "Installed collections include:" in output as success signal.
 
 **Transient error handling:** If `ade install` fails with a transient HTTP error (504, 502, 429, connection timeout, connection refused), the layer retries up to 3 times with exponential backoff (5s, 15s, 45s). If all retries fail, the error is reported as a finding with the retry history.
 
@@ -159,60 +160,66 @@ class LayerResult:
 - Galaxy server auth failures
 - Collections not found on any configured server
 - Transient errors that persisted after 3 retries
+- Python dep build failures (as warnings, forwarded to Layer 2/3 for resolution)
 
 **Gate:** Layer 2 is skipped if layer 1 fails (collections must be installed to introspect deps).
 
 ## Layer 2: Dependency Discovery + Validation
 
-**Purpose:** Discover all transitive Python and system dependencies from installed collections, validate they resolve, and check them against the user's declared deps.
+**Purpose:** Discover all transitive Python and system dependencies from installed collections, validate them against the user's declared deps, and incorporate any Python build failures from Layer 1.
 
 **Implementation:**
-1. Run `ade check --venv <path>` to validate installed collections. Parse its output for:
-   - `pip install --dry-run --report` results (Python dep conflicts)
-   - `bindep -b` results (missing system packages)
-2. Run `ansible-builder introspect <venv-site-packages>` to get the full discovered dependency lists (Python and system).
-3. Diff discovered Python deps against the user's declared `requirements.txt` / `python-packages.txt`:
-   - Warn on undeclared transitive Python deps (deps the collections need but the user didn't list).
-4. Diff discovered system deps against the user's declared `bindep.txt`:
-   - Warn on undeclared system packages.
-   - Provide the exact `bindep.txt` entry to add.
+1. Read `ade`'s `discovered_requirements.txt` and `discovered_bindep.txt` from `<venv>/.ansible-dev-environment/`. These files are annotated with source collections (e.g., `pytz  # from collection ansible.controller`).
+2. Diff discovered Python deps against the user's declared `requirements.txt` / `python-packages.txt`:
+   - Transitive deps are INFO (shown with `--verbose`). `ansible-builder` handles these automatically.
+3. Diff discovered system deps against the user's declared `bindep.txt`:
+   - Filter by target platform (inferred from base image name: RHEL 8/9, CentOS, Fedora, Debian).
+   - Deduplicate entries.
+   - Warn on undeclared system packages relevant to the target platform.
+4. Incorporate Python build failure findings from Layer 1 (forwarded from `ade install`). These are warnings that defer RPM resolution to Layer 3 (which runs inside the target container).
 
 **Findings reported:**
-- pip resolution conflicts between Python packages
-- Undeclared Python dependencies (discovered by introspection but missing from user's file)
-- Undeclared system dependencies (discovered by introspection but missing from user's `bindep.txt`)
-- Drift between declared and discovered deps
+- Transitive Python deps (INFO, not actionable — ansible-builder handles them)
+- Undeclared system deps for the target platform
+- Python build failures from Layer 1 (deferred to Layer 3 for package resolution)
 
-**Gate:** Layer 3 is independent of layer 2 pass/fail (it tests against the base image, not the venv). However, if layer 1 failed, layer 3 is also skipped.
+**Note:** `ansible-builder introspect` is not used. `ade` already performs introspection and writes the results with source collection annotations.
 
-## Layer 3: Container Wheel Build Test (opt-in)
+**Gate:** Layer 3 auto-triggers when Layer 1 reports Python build failures. Layer 3 is also available via `--container-test` for manual opt-in. If Layer 1 failed, both Layer 2 and Layer 3 are skipped.
 
-**Purpose:** Verify that Python packages with C extensions can actually compile inside the target base image. This catches undeclared system deps that collections don't properly declare in their metadata — the failures that only surface during `ansible-builder build`.
+## Layer 3: Container Wheel Build Test
 
-**Enabled by:** `--container-test` flag. Skipped by default (requires podman and pulls the base image).
+**Purpose:** Verify that Python packages with C extensions can actually compile inside the target base image. This catches undeclared system deps that collections don't properly declare in their metadata — the failures that only surface during `ansible-builder build`. All package resolution happens inside the container, giving correct results regardless of host platform.
+
+**Triggered by:**
+- **Automatically** when Layer 1 (ade install) reports Python dep build failures. Failed package names are passed from Layer 1 so they get tested even if not in the known source-only list.
+- **Manually** via `--container-test` flag (tests known source-only packages even without Layer 1 failures).
+- Skipped if no container runtime is available and no build failures occurred.
 
 **Implementation:**
 1. Parse the base image from `execution-environment.yml`.
-2. `podman pull` the base image.
-3. From layer 2's discovered Python deps, identify source-only packages (packages that don't have a pre-built wheel for the target platform). Check with `pip download --dry-run --no-binary :all:` or inspect PyPI metadata.
-4. For each source-only package, run inside the base image container:
+2. Pull the base image via podman (or docker).
+3. Detect the Python version inside the base image (`python3 --version`).
+4. Build the test package list from: known source-only packages (systemd-python, gssapi, ncclient, lxml, etc.) + packages that failed during ade install + extras that pull in source-only deps (e.g., `aiokafka[gssapi]` → also test `gssapi`). Deduplicated.
+5. For each package, run inside the base image container:
    ```
-   podman run --rm <base-image> sh -c "
-     microdnf install -y <declared-bindep-packages> &&
-     pip wheel --no-binary :all: <package>
-   "
+   microdnf install -y <declared-bindep-packages> &&
+   microdnf install -y python3-pip python3-devel gcc &&
+   python3.X -m ensurepip &&
+   python3.X -m pip wheel --no-binary :all: '<package>' -w /tmp/wheels
    ```
-5. If a wheel build fails:
+6. If a wheel build fails:
    a. Parse the error output for the missing file or command (e.g., `krb5-config: command not found`, `Python.h: No such file or directory`, `libsystemd.pc not found`).
-   b. Run `dnf provides '*/<missing-file>'` inside the same container to find the RPM that provides it.
-   c. Report the specific package to add to `bindep.txt`.
-6. If `dnf provides` doesn't find a match, report the raw error and missing file for manual investigation.
+   b. For `Python.h`: resolve to `python{version}-devel` using the detected Python version (e.g., `python3.12-devel`).
+   c. For other files: install `dnf` inside the container (minimal images only have `microdnf`), then run `dnf provides` to find the providing package. Prefer `-devel` packages in results.
+   d. For Debian-based containers: use `apt-file search` instead.
+7. If resolution fails, report the raw error and missing file for manual investigation.
 
 **Findings reported:**
-- C extension build failures with the specific missing `-devel` package and the `bindep.txt` entry to add
-- Dependency chain that led to the source-only package (e.g., `ansible.eda → aiokafka[gssapi] → gssapi`)
+- C extension build failures with the specific package to add to `bindep.txt`
+- Correct package names for the target platform (not the host — e.g., `krb5-devel` on RHEL, not `heimdal-devel` from Fedora)
 
-**Python version detection:** The script detects the Python version inside the base image (by running `python3 --version` or checking `$PYCMD`) and uses the correct versioned `-devel` package name (e.g., `python3.12-devel` instead of `python3-devel`).
+**Known limitation:** Each package is tested independently. If package A needs `python3.12-devel` and package B needs `krb5-devel`, but B also needs `python3.12-devel` to get past the compilation stage, B will report `python3.12-devel` instead of `krb5-devel`. Future enhancement: install discovered fixes cumulatively before testing subsequent packages.
 
 ## Authentication
 
@@ -297,9 +304,8 @@ Result: FAIL (1 error, 2 warnings)
 | Tool | Minimum version | Purpose |
 |---|---|---|
 | Python | 3.10+ | Runtime (dataclasses, type hints, `\|` union syntax) |
-| `ansible-dev-environment` (`ade`) | 24.0.0+ | Collection installation, dependency checking, introspection |
-| `ansible-builder` | 3.0.0+ | Dependency introspection via `ansible-builder introspect` |
-| `pip` | 22.0+ | Dry-run dependency resolution (`--dry-run --report`) |
+| `ansible-dev-environment` (`ade`) | 24.0.0+ | Collection installation, dependency discovery, introspection |
+| `ansible-builder` | 3.0.0+ | Only needed for `--build` flag (runs the actual EE build) |
 
 ### Optional
 
@@ -317,9 +323,11 @@ Layer 3 interacts with the container runtime through a thin abstraction (`Contai
 
 ## Future Enhancements
 
-- **Auto-populated dependency cache:** After layer 3 discovers a mapping (e.g., `gssapi` → `krb5-devel`), write it to a local `.ee-preflight-cache.json`. Subsequent runs check the cache first for instant answers, falling back to `dnf provides` for unknowns. Cache entries include the base image and timestamp so they can be invalidated.
-- **Docker support:** Add `docker` as an alternative container runtime for layer 3 via the `ContainerRuntime` interface. Auto-detect which is available, or allow `--runtime docker|podman`.
+- **Cumulative fix install in Layer 3:** Install discovered fixes (e.g., `python3.12-devel`) before testing subsequent packages. This catches dependencies hidden behind earlier failures (e.g., `krb5-devel` masked by `Python.h`).
+- **Auto-populated dependency cache:** After Layer 3 discovers a mapping (e.g., `gssapi` → `krb5-devel`), write it to a local `.ee-preflight-cache.json`. Subsequent runs check the cache first for instant answers, falling back to `dnf provides` for unknowns. Cache entries include the base image and timestamp so they can be invalidated.
+- **Docker support:** Add `docker` as an alternative container runtime for Layer 3 via the `ContainerRuntime` interface. Auto-detect which is available, or allow `--runtime docker|podman`.
 - **Devcontainer support:** Run inside Ansible devcontainers where podman/docker may be accessed via docker-in-docker or a mounted socket. Detect the devcontainer environment and adjust runtime paths accordingly.
 - **CI integration:** GitHub Action that runs `ee-preflight` on PRs before `ansible-builder`, failing fast with actionable output.
 - **Base image collection diffing:** For `ee-supported` base images, inspect what's already installed and warn about collections/deps in the requirements that duplicate what's in the base image (the delta-only strategy).
 - **`--init` mode:** Scaffold a new EE project using `ansible-creator init execution_env`, then run preflight validation on it. Combines scaffolding with validation in a single workflow.
+- **Heavy collection warnings:** Flag collections with complex system deps (e.g., `ansible.eda` with systemd-python + gssapi) and suggest whether they belong in a standard EE vs. a DE.
