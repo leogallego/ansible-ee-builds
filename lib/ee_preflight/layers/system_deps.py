@@ -94,14 +94,31 @@ def _find_source_only_packages(python_deps: list[str]) -> list[str]:
         "systemd_python", "gssapi", "ncclient", "lxml",
         "ovirt_engine_sdk_python", "python_ldap", "pynacl",
     }
+    # Extras that pull in source-only deps (e.g., aiokafka[gssapi] → gssapi)
+    extras_mapping = {
+        "gssapi": "gssapi",
+    }
+
     source_pkgs: list[str] = []
     seen: set[str] = set()
     for dep in python_deps:
-        name = dep.split(">=")[0].split("==")[0].split("<")[0].split("[")[0].strip()
+        # Check the package name itself
+        name = dep.split(">=")[0].split("==")[0].split("<")[0].split("[")[0].split(";")[0].strip()
         normalized = name.lower().replace("-", "_")
         if normalized in known_source_only and normalized not in seen:
             seen.add(normalized)
-            source_pkgs.append(dep)
+            source_pkgs.append(name)
+            continue
+
+        # Check if extras pull in source-only deps
+        if "[" in dep:
+            extras = dep.split("[")[1].split("]")[0].split(",")
+            for extra in extras:
+                extra = extra.strip().lower()
+                if extra in extras_mapping and extras_mapping[extra] not in seen:
+                    seen.add(extras_mapping[extra])
+                    source_pkgs.append(extras_mapping[extra])
+
     return source_pkgs
 
 
