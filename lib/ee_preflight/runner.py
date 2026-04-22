@@ -60,7 +60,7 @@ def run(
             ])
             return results
 
-        r1, python_build_findings = galaxy.validate(ctx)
+        r1, python_build_findings, failed_pkgs = galaxy.validate(ctx)
         results.append(r1)
 
         if r1.has_errors:
@@ -76,13 +76,10 @@ def run(
                     r2.status = "fail"
             results.append(r2)
 
-            # Auto-trigger Layer 3 if ade hit Python build failures —
-            # ade stops at the first failure, so we need the container
-            # to test all source-only packages independently
             if python_build_findings:
                 ctx.container_test = True
 
-            r3 = system_deps.validate(ctx)
+            r3 = system_deps.validate(ctx, extra_packages=failed_pkgs)
             results.append(r3)
 
         if fix:

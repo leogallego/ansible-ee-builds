@@ -16,7 +16,7 @@ MISSING_FILE_PATTERNS = [
 ]
 
 
-def validate(ctx: ValidateContext) -> LayerResult:
+def validate(ctx: ValidateContext, extra_packages: set[str] | None = None) -> LayerResult:
     if not ctx.container_test:
         return LayerResult(name="system_deps", status="skipped", findings=[])
 
@@ -46,6 +46,16 @@ def validate(ctx: ValidateContext) -> LayerResult:
 
     discovered_python = _get_discovered_python(ctx)
     source_pkgs = _find_source_only_packages(discovered_python)
+
+    # Add packages that failed to build in ade (Layer 1) — these may not
+    # be in the known_source_only list but we know they need compilation
+    if extra_packages:
+        seen = {p.lower().replace("-", "_") for p in source_pkgs}
+        for pkg in extra_packages:
+            normalized = pkg.lower().replace("-", "_")
+            if normalized not in seen:
+                source_pkgs.append(pkg)
+                seen.add(normalized)
 
     if not source_pkgs:
         findings.append(Finding(
@@ -215,13 +225,20 @@ def _find_providing_package(
         timeout=120,
     )
     if result.returncode == 0 and result.stdout.strip():
+        candidates: list[str] = []
         for line in result.stdout.splitlines():
             line = line.strip()
-            if not line or line.startswith("Last") or line.startswith("=") or line.startswith("Repo"):
+            if not line or line.startswith("Last") or line.startswith("=") or line.startswith("Repo") or line.startswith("Matched") or line.startswith("Filename") or line.startswith("Provide"):
                 continue
             match = re.match(r"^(\S+?)-\d", line)
             if match:
-                return match.group(1)
+                candidates.append(match.group(1))
+        # Prefer -devel packages for header/pkgconfig lookups
+        for c in candidates:
+            if c.endswith("-devel"):
+                return c
+        if candidates:
+            return candidates[0]
 
     # Try apt-file for Debian-based containers
     result = runtime.run(

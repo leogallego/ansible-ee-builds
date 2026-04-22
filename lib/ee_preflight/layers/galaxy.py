@@ -44,7 +44,7 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
 
     reqs_path = _get_requirements_path(ctx, findings)
     if reqs_path is None:
-        return LayerResult(name="galaxy", status="fail", findings=findings), []
+        return LayerResult(name="galaxy", status="fail", findings=findings), [], set()
 
     env = _build_env(ctx)
 
@@ -68,26 +68,30 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
                 severity=Severity.ERROR,
                 message="Galaxy resolution timed out after 600s",
             ))
-            return LayerResult(name="galaxy", status="fail", findings=findings), []
+            return LayerResult(name="galaxy", status="fail", findings=findings), [], set()
 
         output = result.stdout + result.stderr
         collections_installed = "Installed collections include:" in output
 
         if result.returncode == 0 or collections_installed:
             installed = _count_collections(output)
-            python_build_errors = _parse_python_build_errors(output) if result.returncode != 0 else []
+            if result.returncode != 0:
+                python_build_findings, failed_pkgs = _parse_python_build_errors(output)
+            else:
+                python_build_findings, failed_pkgs = [], set()
 
             findings.append(Finding(
                 severity=Severity.INFO,
                 message=f"{installed} collections resolved and installed",
             ))
 
-            if python_build_errors:
+            if python_build_findings:
                 return (
                     LayerResult(name="galaxy", status="pass", findings=findings),
-                    python_build_errors,
+                    python_build_findings,
+                    failed_pkgs,
                 )
-            return LayerResult(name="galaxy", status="pass", findings=findings), []
+            return LayerResult(name="galaxy", status="pass", findings=findings), [], set()
 
         if _is_transient(output) and attempt < MAX_RETRIES - 1:
             wait = BACKOFF_SECONDS[attempt]
@@ -100,15 +104,13 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
 
         # Separate collection errors from Python build failures
         collection_errors = _parse_collection_errors(output)
-        python_build_errors = _parse_python_build_errors(output)
+        python_build_findings, failed_pkgs = _parse_python_build_errors(output)
 
         if collection_errors:
             findings.extend(collection_errors)
-            return LayerResult(name="galaxy", status="fail", findings=findings), []
+            return LayerResult(name="galaxy", status="fail", findings=findings), [], set(), set()
 
-        if python_build_errors:
-            # Collections resolved but Python deps failed to build —
-            # that's a Layer 2 finding, not a Layer 1 failure
+        if python_build_findings:
             installed = _count_collections(output)
             findings.append(Finding(
                 severity=Severity.INFO,
@@ -116,7 +118,8 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
             ))
             return (
                 LayerResult(name="galaxy", status="pass", findings=findings),
-                python_build_errors,
+                python_build_findings,
+                failed_pkgs,
             )
 
         # Unknown failure
@@ -127,9 +130,9 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
                 l.strip() for l in last_lines if l.strip()
             ),
         ))
-        return LayerResult(name="galaxy", status="fail", findings=findings), []
+        return LayerResult(name="galaxy", status="fail", findings=findings), [], set()
 
-    return LayerResult(name="galaxy", status="fail", findings=findings), []
+    return LayerResult(name="galaxy", status="fail", findings=findings), [], set()
 
 
 def _get_requirements_path(
@@ -221,6 +224,17 @@ def _parse_python_build_errors(output: str) -> list[Finding]:
     if not any(p in output for p in PYTHON_BUILD_PATTERNS):
         return findings
 
+    # Extract which packages failed to build
+    failed_pkgs: set[str] = set()
+    for pattern in [
+        r"Failed to build '(\S+)'",
+        r"Failed building wheel for (\S+)",
+        r"Failed to build installable wheels.*?╰─> (\S+)",
+        r"error: subprocess-exited-with-error.*?Getting requirements.*?for (\S+)",
+    ]:
+        for match in re.finditer(pattern, output):
+            failed_pkgs.add(match.group(1).lower().replace("-", "_"))
+
     missing_file_patterns = [
         (r"fatal error: (\S+\.h): No such file or directory", "header"),
         (r"(\S+): command not found", "command"),
@@ -239,18 +253,16 @@ def _parse_python_build_errors(output: str) -> list[Finding]:
                 severity=Severity.WARNING,
                 message=f"Python dep build failed: {missing} not found ({kind})",
                 fix="Layer 3 container test will resolve the exact package",
+                source=f"failed packages: {', '.join(sorted(failed_pkgs))}" if failed_pkgs else "detected during ade install",
+            ))
+
+    if not findings and failed_pkgs:
+        for pkg in sorted(failed_pkgs):
+            findings.append(Finding(
+                severity=Severity.WARNING,
+                message=f"Python dep failed to build: {pkg}",
+                fix="Layer 3 container test will resolve the exact package",
                 source="detected during ade install",
             ))
 
-    if not findings:
-        for line in output.splitlines():
-            if "Failed to build" in line or "Failed building wheel" in line:
-                pkg = line.strip().split("'")[1] if "'" in line else "unknown"
-                findings.append(Finding(
-                    severity=Severity.WARNING,
-                    message=f"Python dep failed to build: {pkg}",
-                    fix="Layer 3 container test will resolve the exact package",
-                    source="detected during ade install",
-                ))
-
-    return findings
+    return findings, failed_pkgs
