@@ -33,8 +33,8 @@ MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
 
 
-def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
-    """Returns (layer1_result, python_build_findings).
+def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding], set[str]]:
+    """Returns (layer1_result, python_build_findings, failed_pkgs).
 
     Python build findings are separated so the runner can attach them
     to Layer 2 instead of failing Layer 1.
@@ -108,7 +108,7 @@ def validate(ctx: ValidateContext) -> tuple[LayerResult, list[Finding]]:
 
         if collection_errors:
             findings.extend(collection_errors)
-            return LayerResult(name="galaxy", status="fail", findings=findings), [], set(), set()
+            return LayerResult(name="galaxy", status="fail", findings=findings), [], set()
 
         if python_build_findings:
             installed = _count_collections(output)
@@ -218,11 +218,11 @@ def _parse_collection_errors(output: str) -> list[Finding]:
     return findings
 
 
-def _parse_python_build_errors(output: str) -> list[Finding]:
+def _parse_python_build_errors(output: str) -> tuple[list[Finding], set[str]]:
     findings: list[Finding] = []
 
     if not any(p in output for p in PYTHON_BUILD_PATTERNS):
-        return findings
+        return findings, set()
 
     # Extract which packages failed to build
     failed_pkgs: set[str] = set()

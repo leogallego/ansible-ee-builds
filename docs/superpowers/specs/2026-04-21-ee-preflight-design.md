@@ -219,7 +219,7 @@ class LayerResult:
 - C extension build failures with the specific package to add to `bindep.txt`
 - Correct package names for the target platform (not the host — e.g., `krb5-devel` on RHEL, not `heimdal-devel` from Fedora)
 
-**Known limitation:** Each package is tested independently. If package A needs `python3.12-devel` and package B needs `krb5-devel`, but B also needs `python3.12-devel` to get past the compilation stage, B will report `python3.12-devel` instead of `krb5-devel`. Future enhancement: install discovered fixes cumulatively before testing subsequent packages.
+**Cumulative retry:** After testing all packages, if any missing RPMs were discovered, failed packages are retried with those RPMs installed. This repeats (up to 3 rounds) until no new RPMs are found. This catches dependencies hidden behind earlier failures — e.g., `gssapi` needs `python3.12-devel` to compile past `Python.h`, then reveals `krb5-devel` on the retry. All discovered RPMs are reported as fix suggestions regardless of which pass found them.
 
 ## Authentication
 
@@ -323,7 +323,7 @@ Layer 3 interacts with the container runtime through a thin abstraction (`Contai
 
 ## Future Enhancements
 
-- **Cumulative fix install in Layer 3:** Install discovered fixes (e.g., `python3.12-devel`) before testing subsequent packages. This catches dependencies hidden behind earlier failures (e.g., `krb5-devel` masked by `Python.h`).
+- ~~**Cumulative fix install in Layer 3:**~~ Implemented. Retry loop installs discovered RPMs and retests failed packages (up to 3 rounds).
 - **Auto-populated dependency cache:** After Layer 3 discovers a mapping (e.g., `gssapi` → `krb5-devel`), write it to a local `.ee-preflight-cache.json`. Subsequent runs check the cache first for instant answers, falling back to `dnf provides` for unknowns. Cache entries include the base image and timestamp so they can be invalidated.
 - **Docker support:** Add `docker` as an alternative container runtime for Layer 3 via the `ContainerRuntime` interface. Auto-detect which is available, or allow `--runtime docker|podman`.
 - **Devcontainer support:** Run inside Ansible devcontainers where podman/docker may be accessed via docker-in-docker or a mounted socket. Detect the devcontainer environment and adjust runtime paths accordingly.

@@ -47,8 +47,6 @@ def validate(ctx: ValidateContext, extra_packages: set[str] | None = None) -> La
     discovered_python = _get_discovered_python(ctx)
     source_pkgs = _find_source_only_packages(discovered_python)
 
-    # Add packages that failed to build in ade (Layer 1) — these may not
-    # be in the known_source_only list but we know they need compilation
     if extra_packages:
         seen = {p.lower().replace("-", "_") for p in source_pkgs}
         for pkg in extra_packages:
@@ -66,8 +64,53 @@ def validate(ctx: ValidateContext, extra_packages: set[str] | None = None) -> La
 
     bindep_install = _get_bindep_install_cmd(ctx)
 
+    discovered_rpms: set[str] = set()
+    all_pkg_findings: list[Finding] = []
+    failed_pkgs: set[str] = set()
+
     for pkg in source_pkgs:
-        _test_wheel_build(ctx, runtime, image, pkg, bindep_install, python_version, findings)
+        pkg_result, rpm = _test_wheel_build(
+            ctx, runtime, image, pkg, bindep_install, python_version,
+        )
+        all_pkg_findings.extend(pkg_result)
+        if rpm:
+            discovered_rpms.add(rpm)
+            failed_pkgs.add(pkg)
+        elif any(f.severity == Severity.ERROR for f in pkg_result):
+            failed_pkgs.add(pkg)
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        if not failed_pkgs or not discovered_rpms:
+            break
+
+        prev_count = len(discovered_rpms)
+        all_pkg_findings.append(Finding(
+            severity=Severity.INFO,
+            message=(
+                f"Retrying {len(failed_pkgs)} failed package(s) with "
+                f"discovered deps: {', '.join(sorted(discovered_rpms))}"
+            ),
+        ))
+
+        still_failing: set[str] = set()
+        for pkg in list(failed_pkgs):
+            pkg_result, rpm = _test_wheel_build(
+                ctx, runtime, image, pkg, bindep_install, python_version,
+                extra_rpms=discovered_rpms,
+            )
+            all_pkg_findings.extend(pkg_result)
+            if rpm:
+                discovered_rpms.add(rpm)
+                still_failing.add(pkg)
+            elif any(f.severity == Severity.ERROR for f in pkg_result):
+                still_failing.add(pkg)
+
+        failed_pkgs = still_failing
+        if len(discovered_rpms) == prev_count:
+            break
+
+    findings.extend(all_pkg_findings)
 
     status = "fail" if any(f.severity == Severity.ERROR for f in findings) else "pass"
     return LayerResult(name="system_deps", status=status, findings=findings)
@@ -149,14 +192,18 @@ def _test_wheel_build(
     pkg: str,
     bindep_install: str,
     python_version: str,
-    findings: list[Finding],
-) -> None:
+    extra_rpms: set[str] | None = None,
+) -> tuple[list[Finding], str | None]:
     pkg_name = pkg.split(">=")[0].split("==")[0].split("<")[0].strip()
     pkgmgr = ctx.ee.options.get("package_manager_path", "/usr/bin/microdnf")
     pycmd = f"python{python_version}"
 
+    rpm_install = bindep_install
+    if extra_rpms:
+        rpm_install += f" && {pkgmgr} install -y {' '.join(sorted(extra_rpms))} 2>/dev/null; true"
+
     cmd = (
-        f"{bindep_install} && "
+        f"{rpm_install} && "
         f"{pkgmgr} install -y python3-pip python3-devel gcc 2>/dev/null; "
         f"{pycmd} -m ensurepip 2>/dev/null; "
         f"{pycmd} -m pip install --upgrade pip setuptools wheel && "
@@ -164,13 +211,14 @@ def _test_wheel_build(
     )
 
     result = runtime.run(image, cmd, timeout=180)
+    findings: list[Finding] = []
 
     if result.returncode == 0:
         findings.append(Finding(
             severity=Severity.INFO,
             message=f"Wheel build OK: {pkg_name}",
         ))
-        return
+        return findings, None
 
     output = result.stdout + result.stderr
     missing_file = _extract_missing_file(output)
@@ -184,6 +232,7 @@ def _test_wheel_build(
                 fix=f"Add '{pkg_provider}' to bindep.txt",
                 source=f"required by {pkg_name}",
             ))
+            return findings, pkg_provider
         else:
             findings.append(Finding(
                 severity=Severity.ERROR,
@@ -191,12 +240,14 @@ def _test_wheel_build(
                 fix=f"Find the package providing {missing_file} for your base image and add it to bindep.txt",
                 source=f"required by {pkg_name}",
             ))
+            return findings, None
     else:
         findings.append(Finding(
             severity=Severity.ERROR,
             message=f"{pkg_name} failed to build",
             source=f"pip wheel output: {output[-300:]}",
         ))
+        return findings, None
 
 
 def _extract_missing_file(output: str) -> str | None:

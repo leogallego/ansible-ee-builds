@@ -12,4 +12,6 @@ ansible.cfg
 .venv
 **/.vscode
 **/.devcontainer
-**/devcontainer.json**/__pycache__
+**/devcontainer.json
+**/__pycache__
+tmp/

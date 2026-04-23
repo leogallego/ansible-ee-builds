@@ -86,7 +86,7 @@ def run(
             all_findings = [f for r in results for f in r.findings]
             fixable = [
                 f for f in all_findings
-                if f.fix and f.severity == Severity.WARNING
+                if f.fix and f.severity in (Severity.WARNING, Severity.ERROR)
             ]
             if fixable:
                 changes = apply_fixes(ee, fixable)
@@ -96,6 +96,31 @@ def run(
                         status="pass",
                         findings=[Finding(severity=Severity.INFO, message=change)],
                     ))
+
+                if changes:
+                    # Re-validate cheap layers after fixes were applied.
+                    # Layer 1 (galaxy) and Layer 3 (system_deps) are expensive
+                    # and kept as-is; only re-run Layer 0 and Layer 2.
+                    ee = parse_ee(ee_path)
+                    ctx = ValidateContext(
+                        ee=ee,
+                        venv_path=venv_path,
+                        fix=False,
+                        container_test=ctx.container_test,
+                        verbose=verbose,
+                    )
+
+                    new_r0 = prechecks.validate(ctx)
+                    for i, r in enumerate(results):
+                        if r.name == "prechecks":
+                            results[i] = new_r0
+                            break
+
+                    new_r2 = python_deps.validate(ctx)
+                    for i, r in enumerate(results):
+                        if r.name == "python_deps":
+                            results[i] = new_r2
+                            break
 
         if build:
             has_errors = any(r.has_errors for r in results)
